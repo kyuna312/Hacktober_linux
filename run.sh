@@ -12,19 +12,19 @@ pkill qemu-system-aarch64 2>/dev/null || true
 cargo clean
 cargo build --release
 
-# Run QEMU with optimized configuration for M1
+# Run QEMU with fixed display configuration for macOS
 qemu-system-aarch64 \
-    -M virt,highmem=off \
-    -cpu max \
+    -M virt \
+    -cpu cortex-a72 \
     -m 128M \
     -device ramfb \
-    -device virtio-gpu-pci,xres=1024,yres=768,max_outputs=1 \
+    -device virtio-gpu-pci,xres=800,yres=600,max_outputs=1 \
     -device virtio-keyboard-pci \
     -device virtio-mouse-pci \
-    -display default,show-cursor=on \
-    -serial mon:stdio \
-    -kernel target/aarch64-unknown-none/release/hacktober_linux \
-    -append "console=ttyAMA0 keep_bootcon" \
-    -d guest_errors
+    -display cocoa \
+    -serial stdio \
+    -kernel target/aarch64-unknown-none/release/nyannix \
+    -append "console=ttyAMA0" \
+    -smp 1
 
 # Note: To exit, press Ctrl+C or close the QEMU window

@@ -1,133 +1,256 @@
 //! Terminal implementation
 
-use crate::{console, cpu, gui};
+use crate::console;
+use crate::drivers::virtio::GPU;
+use spin::Mutex;
 
-const MAX_CMD_LEN: usize = 64;
-static mut CMD_BUFFER: [u8; MAX_CMD_LEN] = [0; MAX_CMD_LEN];
-static mut CMD_POS: usize = 0;
+const TERM_WIDTH: u32 = 80;
+const TERM_HEIGHT: u32 = 25;
+const CHAR_WIDTH: u32 = 12;
+const CHAR_HEIGHT: u32 = 16;
 
-pub fn run() -> ! {
-    loop {
-        unsafe {
-            crate::cpu::wfi();
+pub struct Terminal {
+    cursor_x: u32,
+    cursor_y: u32,
+    fg_color: u32,
+    bg_color: u32,
+    buffer: [[char; 80]; 25],
+    input_buffer: [char; 80],
+    input_pos: usize,
+}
+
+impl Terminal {
+    pub const fn new() -> Self {
+        Self {
+            cursor_x: 0,
+            cursor_y: 0,
+            fg_color: 0xFF69B4, // Hot pink
+            bg_color: 0x000000, // Black
+            buffer: [[' '; 80]; 25],
+            input_buffer: [' '; 80],
+            input_pos: 0,
         }
     }
-}
 
-fn show_prompt(line: u16) {
-    gui::TERMINAL_WINDOW.write_at(2, line, "\x1B[1;32mNyanNix\x1B[0m:\x1B[1;34m$\x1B[0m ");
-}
+    pub fn init(&mut self) {
+        if let Some(mut gpu) = GPU.try_lock() {
+            gpu.clear_screen(self.bg_color);
+            self.redraw();
+            gpu.flush();
+        }
+    }
 
-fn read_command(current_line: u16) -> u16 {
-    unsafe {
-        CMD_POS = 0;
-        let mut cursor_pos: u16 = 0;
+    pub fn write_char(&mut self, c: char) {
+        match c {
+            '\n' => self.new_line(),
+            '\r' => self.cursor_x = 0,
+            '\x08' => {
+                if self.cursor_x > 0 {
+                    self.cursor_x -= 1
+                }
+            }
+            _ => {
+                if self.cursor_x < TERM_WIDTH {
+                    self.buffer[self.cursor_y as usize][self.cursor_x as usize] = c;
+                    self.draw_char(self.cursor_x, self.cursor_y);
+                    self.cursor_x += 1;
+                }
+                if self.cursor_x >= TERM_WIDTH {
+                    self.new_line();
+                }
+            }
+        }
+    }
 
-        loop {
-            // Wait for keyboard input
-            while !console::has_input() {
-                cpu::wait_for_interrupt();
+    fn draw_char(&mut self, x: u32, y: u32) {
+        if let Some(mut gpu) = GPU.try_lock() {
+            let px = 20 + x * CHAR_WIDTH;
+            let py = 40 + y * CHAR_HEIGHT;
+            let c = self.buffer[y as usize][x as usize];
+
+            // Clear background
+            gpu.draw_rect(px, py, CHAR_WIDTH, CHAR_HEIGHT, self.bg_color);
+
+            // Draw character if it's not a space
+            if c != ' ' {
+                gpu.draw_rect(
+                    px + 2,
+                    py + 2,
+                    CHAR_WIDTH - 4,
+                    CHAR_HEIGHT - 4,
+                    self.fg_color,
+                );
             }
 
-            if let Some(c) = console::getc() {
-                match c {
-                    b'\r' | b'\n' => {
-                        console::puts("\n");
-                        let next_line = execute_command(current_line + 1);
-                        return next_line;
+            gpu.flush();
+        }
+    }
+
+    fn new_line(&mut self) {
+        self.cursor_x = 0;
+        if self.cursor_y < TERM_HEIGHT - 1 {
+            self.cursor_y += 1;
+        } else {
+            self.scroll_up();
+        }
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor_x > 0 {
+            self.cursor_x -= 1;
+            self.buffer[self.cursor_y as usize][self.cursor_x as usize] = ' ';
+            self.draw_char(self.cursor_x, self.cursor_y);
+        }
+    }
+
+    fn scroll_up(&mut self) {
+        // Move all lines up
+        for y in 1..TERM_HEIGHT as usize {
+            for x in 0..TERM_WIDTH as usize {
+                self.buffer[y - 1][x] = self.buffer[y][x];
+            }
+        }
+
+        // Clear bottom line
+        for x in 0..TERM_WIDTH as usize {
+            self.buffer[TERM_HEIGHT as usize - 1][x] = ' ';
+        }
+
+        // Redraw entire screen
+        self.redraw();
+    }
+
+    fn redraw(&mut self) {
+        if let Some(mut gpu) = GPU.try_lock() {
+            // Clear screen
+            gpu.draw_rect(
+                20,
+                40,
+                TERM_WIDTH * CHAR_WIDTH,
+                TERM_HEIGHT * CHAR_HEIGHT,
+                self.bg_color,
+            );
+
+            // Redraw all characters
+            for y in 0..TERM_HEIGHT {
+                for x in 0..TERM_WIDTH {
+                    let c = self.buffer[y as usize][x as usize];
+                    if c != ' ' {
+                        self.draw_char(x, y);
                     }
-                    // Handle backspace and delete
-                    8 | 127 if CMD_POS > 0 => {
-                        CMD_POS -= 1;
-                        cursor_pos -= 1;
-                        // Move cursor back and clear character
-                        gui::TERMINAL_WINDOW.write_at(4 + cursor_pos, current_line, " ");
-                        gui::TERMINAL_WINDOW.write_at(4 + cursor_pos, current_line, "");
+                }
+            }
+
+            gpu.flush();
+        }
+    }
+
+    pub fn write_string(&mut self, s: &str) {
+        for c in s.chars() {
+            self.write_char(c);
+        }
+    }
+
+    pub fn process_command(&mut self) {
+        // Convert input buffer to command string
+        let mut cmd = [0u8; 80];
+        let mut cmd_len = 0;
+
+        for i in 0..self.input_pos {
+            if self.input_buffer[i] != ' ' || cmd_len > 0 {
+                cmd[cmd_len] = self.input_buffer[i] as u8;
+                cmd_len += 1;
+            }
+        }
+
+        // Clear input buffer
+        self.input_pos = 0;
+        self.input_buffer = [' '; 80];
+
+        // Convert command bytes to str
+        if let Ok(cmd_str) = core::str::from_utf8(&cmd[..cmd_len]) {
+            match cmd_str.trim() {
+                "help" => {
+                    self.write_string("\nAvailable commands:\n");
+                    self.write_string("  help     - Show this help message\n");
+                    self.write_string("  ls       - List files\n");
+                    self.write_string("  clear    - Clear screen\n");
+                    self.write_string("  nyan     - Show Nyan Cat\n");
+                    self.write_string("  version  - Show NyanNix version\n");
+                }
+                "ls" => {
+                    self.write_string("\nNyanNix File System:\n");
+                    self.write_string("  boot/\n");
+                    self.write_string("  home/\n");
+                    self.write_string("  nya/\n");
+                }
+                "clear" => {
+                    if let Some(mut gpu) = GPU.try_lock() {
+                        gpu.clear_screen(self.bg_color);
+                        gpu.flush();
                     }
-                    // Handle printable characters
-                    32..=126 if CMD_POS < MAX_CMD_LEN - 1 => {
-                        CMD_BUFFER[CMD_POS] = c;
-                        CMD_POS += 1;
-                        cursor_pos += 1;
-                        // Print character
-                        let mut buf = [0; 1];
-                        buf[0] = c;
-                        gui::TERMINAL_WINDOW.write_at(
-                            3 + cursor_pos,
-                            current_line,
-                            core::str::from_utf8(&buf).unwrap_or(""),
-                        );
-                    }
-                    // Handle Ctrl+C
-                    3 => {
-                        console::puts("^C\n");
-                        return current_line + 1;
-                    }
-                    // Handle Ctrl+D
-                    4 => {
-                        console::puts("exit\n");
-                        return current_line + 1;
-                    }
-                    _ => {}
+                    self.cursor_x = 0;
+                    self.cursor_y = 0;
+                }
+                "nyan" => {
+                    self.write_string("\n");
+                    self.write_string("  /\\___/\\  ~\n");
+                    self.write_string(" ( ^ . ^ )~\n");
+                    self.write_string("  > ' ' <\n");
+                    self.write_string("   ~~~~~\n");
+                }
+                "version" => {
+                    self.write_string("\nNyanNix v1.0.0\n");
+                }
+                "" => {}
+                _ => {
+                    self.write_string("\nCommand not found: ");
+                    self.write_string(cmd_str);
+                    self.write_string("\n");
+                }
+            }
+        }
+        self.write_string("$ ");
+    }
+
+    pub fn handle_input(&mut self, c: char) {
+        match c {
+            '\n' | '\r' => {
+                self.write_char('\n');
+                self.process_command();
+            }
+            '\x08' => {
+                // Backspace
+                if self.input_pos > 0 {
+                    self.input_pos -= 1;
+                    self.input_buffer[self.input_pos] = ' ';
+                    self.backspace();
+                }
+            }
+            _ => {
+                if self.input_pos < 79 && c.is_ascii() {
+                    self.input_buffer[self.input_pos] = c;
+                    self.input_pos += 1;
+                    self.write_char(c);
                 }
             }
         }
     }
 }
 
-fn execute_command(mut current_line: u16) -> u16 {
-    unsafe {
-        let cmd = core::str::from_utf8(&CMD_BUFFER[..CMD_POS])
-            .unwrap_or("")
-            .trim();
-        match cmd {
-            "help" => {
-                show_help(current_line);
-                current_line += 5;
-            }
-            "clear" => {
-                gui::TERMINAL_WINDOW.clear_content();
-                current_line = 5;
-            }
-            "ls" => {
-                list_files(current_line);
-                current_line += 4;
-            }
-            "version" => {
-                show_version(current_line);
-                current_line += 2;
-            }
-            "" => {
-                current_line += 1;
-            }
-            _ => {
-                gui::TERMINAL_WINDOW.write_at(
-                    2,
-                    current_line,
-                    "\x1B[1;31mUnknown command: \x1B[0m",
-                );
-                gui::TERMINAL_WINDOW.write_at(19, current_line, cmd);
-                current_line += 1;
-            }
-        }
+pub static TERM: Mutex<Terminal> = Mutex::new(Terminal::new());
+
+pub fn init() {
+    TERM.lock().init();
+}
+
+pub fn puts(s: &str) {
+    TERM.lock().write_string(s);
+}
+
+pub fn run() -> ! {
+    loop {
+        let c = console::getc() as char;
+        TERM.lock().handle_input(c);
     }
-    current_line
-}
-
-fn show_help(line: u16) {
-    gui::TERMINAL_WINDOW.write_at(2, line, "\x1B[1;36mAvailable commands:\x1B[0m");
-    gui::TERMINAL_WINDOW.write_at(2, line + 1, "  help    - Show this help message");
-    gui::TERMINAL_WINDOW.write_at(2, line + 2, "  clear   - Clear the screen");
-    gui::TERMINAL_WINDOW.write_at(2, line + 3, "  ls      - List files");
-    gui::TERMINAL_WINDOW.write_at(2, line + 4, "  version - Show version");
-}
-
-fn list_files(line: u16) {
-    gui::TERMINAL_WINDOW.write_at(2, line, "\x1B[1;33mboot/\x1B[0m");
-    gui::TERMINAL_WINDOW.write_at(2, line + 1, "\x1B[1;33mkernel/\x1B[0m");
-    gui::TERMINAL_WINDOW.write_at(2, line + 2, "\x1B[1;33msystem/\x1B[0m");
-}
-
-fn show_version(line: u16) {
-    gui::TERMINAL_WINDOW.write_at(2, line, "\x1B[1;35mNyanNix\x1B[0m version 0.1.0");
 }

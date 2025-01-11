@@ -1,18 +1,8 @@
 //! CPU control functions
 
 #[inline(always)]
-pub unsafe fn nop() {
-    core::arch::asm!("nop");
-}
-
-#[inline(always)]
 pub unsafe fn wfi() {
     core::arch::asm!("wfi");
-}
-
-#[inline(always)]
-pub unsafe fn disable_interrupts() {
-    core::arch::asm!("msr daifset, #2");
 }
 
 #[inline(always)]
@@ -21,21 +11,20 @@ pub unsafe fn enable_interrupts() {
 }
 
 #[inline(always)]
-pub fn delay(cycles: u32) {
-    for _ in 0..cycles {
-        unsafe {
-            core::arch::asm!("nop");
-        }
-    }
-}
-
-#[inline(always)]
-pub fn wait_for_interrupt() {
-    unsafe {
-        wfi();
-    }
+pub unsafe fn disable_interrupts() {
+    core::arch::asm!("msr daifset, #2");
 }
 
 pub fn init() {
-    // CPU initialization code
+    unsafe {
+        disable_interrupts();
+        // Basic CPU initialization here
+        enable_interrupts();
+    }
+}
+
+pub fn delay(count: u32) {
+    for _ in 0..count {
+        unsafe { core::arch::asm!("nop") };
+    }
 }

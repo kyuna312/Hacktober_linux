@@ -4,7 +4,9 @@ target = "aarch64-unknown-none"
 [target.aarch64-unknown-none]
 rustflags = [
     "-C", "link-arg=-Tlinker.ld",
-    "-C", "target-cpu=cortex-a72"
+    "-C", "target-cpu=cortex-a72",
+    "-C", "target-feature=+neon",
+    "-C", "opt-level=3"
 ]
 
 [unstable]
