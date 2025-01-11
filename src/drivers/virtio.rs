@@ -1,185 +1,99 @@
-use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
-const VIRTIO_MMIO_BASE: usize = 0x0A00_0000;
-const VIRTIO_STATUS: usize = VIRTIO_MMIO_BASE + 0x70;
-const VIRTIO_CONTROL: usize = VIRTIO_MMIO_BASE + 0x100;
-const VIRTIO_NOTIFY: usize = VIRTIO_MMIO_BASE + 0x50;
-const VIRTIO_CONFIG: usize = VIRTIO_MMIO_BASE + 0x200;
+pub static GPU: Mutex<VirtIOGPU> = Mutex::new(VirtIOGPU::new());
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-// Display configuration
-const FB_WIDTH: u32 = 800;
-const FB_HEIGHT: u32 = 600;
-const FB_STRIDE: u32 = FB_WIDTH * 4;
-const FB_BASE: usize = 0x4000_0000;
+const FRAMEBUFFER_BASE: usize = 0x4000_0000;
+const SCREEN_WIDTH: u32 = 800;
+const SCREEN_HEIGHT: u32 = 600;
 
-// VirtIO GPU commands
-const VIRTIO_GPU_CMD_GET_DISPLAY_INFO: u32 = 0x100;
-const VIRTIO_GPU_CMD_RESOURCE_CREATE_2D: u32 = 0x101;
-const VIRTIO_GPU_CMD_SET_SCANOUT: u32 = 0x103;
-const VIRTIO_GPU_CMD_RESOURCE_FLUSH: u32 = 0x104;
-const VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: u32 = 0x105;
-
-#[repr(C)]
-#[derive(Debug)]
 pub struct VirtIOGPU {
+    framebuffer: &'static mut [u32],
     width: u32,
     height: u32,
-    pub initialized: bool,
-    framebuffer: usize,
-    resource_id: u32,
 }
 
 impl VirtIOGPU {
-    pub const fn new() -> Self {
+    const fn new() -> Self {
         Self {
-            width: FB_WIDTH,
-            height: FB_HEIGHT,
-            initialized: false,
-            framebuffer: FB_BASE,
-            resource_id: 1,
+            framebuffer: &mut [],
+            width: SCREEN_WIDTH,
+            height: SCREEN_HEIGHT,
         }
     }
 
     pub fn init(&mut self) {
-        if self.initialized {
+        if INITIALIZED.load(Ordering::SeqCst) {
             return;
         }
 
-        unsafe {
-            // Reset device
-            write_volatile((VIRTIO_STATUS) as *mut u32, 0);
-            core::hint::spin_loop();
+        self.framebuffer = unsafe {
+            core::slice::from_raw_parts_mut(
+                FRAMEBUFFER_BASE as *mut u32,
+                (SCREEN_WIDTH * SCREEN_HEIGHT) as usize,
+            )
+        };
 
-            // Initialize device
-            write_volatile((VIRTIO_STATUS) as *mut u32, 1); // ACKNOWLEDGE
-            write_volatile((VIRTIO_STATUS) as *mut u32, 2); // DRIVER
-            write_volatile((VIRTIO_STATUS) as *mut u32, 8); // FEATURES_OK
-            write_volatile((VIRTIO_STATUS) as *mut u32, 4); // DRIVER_OK
-
-            // Create 2D resource
-            self.send_command(
-                VIRTIO_GPU_CMD_RESOURCE_CREATE_2D,
-                &[
-                    self.resource_id,
-                    FB_WIDTH,
-                    FB_HEIGHT,
-                    0, // format: B8G8R8A8_UNORM
-                ],
-            );
-
-            // Set scanout
-            self.send_command(
-                VIRTIO_GPU_CMD_SET_SCANOUT,
-                &[
-                    0, // scanout_id
-                    self.resource_id,
-                    0,
-                    0, // x, y
-                    FB_WIDTH,
-                    FB_HEIGHT,
-                ],
-            );
-
-            self.initialized = true;
-            self.clear_screen(0x000000); // Black
-            self.flush();
-        }
-    }
-
-    fn send_command(&self, cmd: u32, data: &[u32]) {
-        unsafe {
-            // Write command
-            write_volatile((VIRTIO_CONTROL) as *mut u32, cmd);
-
-            // Write data
-            for (i, &value) in data.iter().enumerate() {
-                write_volatile((VIRTIO_CONTROL + 4 + i * 4) as *mut u32, value);
-            }
-
-            // Notify device
-            write_volatile((VIRTIO_NOTIFY) as *mut u32, 0);
-
-            // Wait for completion
-            while read_volatile((VIRTIO_CONTROL + 0xFC) as *const u32) & 1 != 0 {
-                core::hint::spin_loop();
-            }
-        }
+        self.clear_screen(0x00336699);
+        INITIALIZED.store(true, Ordering::SeqCst);
     }
 
     pub fn clear_screen(&mut self, color: u32) {
-        if !self.initialized {
-            return;
+        for pixel in self.framebuffer.iter_mut() {
+            *pixel = color;
         }
-
-        unsafe {
-            let fb = self.framebuffer as *mut u32;
-            for i in 0..(self.width * self.height) as isize {
-                write_volatile(fb.offset(i), color);
-            }
-        }
-        self.update_display();
     }
 
     pub fn draw_rect(&mut self, x: u32, y: u32, width: u32, height: u32, color: u32) {
-        if !self.initialized {
-            return;
-        }
+        for dy in 0..height {
+            for dx in 0..width {
+                let px = x + dx;
+                let py = y + dy;
 
-        let x_end = (x + width).min(self.width);
-        let y_end = (y + height).min(self.height);
+                if px >= self.width || py >= self.height {
+                    continue;
+                }
 
-        unsafe {
-            let fb = self.framebuffer as *mut u32;
-            for cy in y..y_end {
-                for cx in x..x_end {
-                    let offset = (cy * self.width + cx) as isize;
-                    write_volatile(fb.offset(offset), color);
+                let pos = (py * self.width + px) as usize;
+                if pos < self.framebuffer.len() {
+                    self.framebuffer[pos] = color;
                 }
             }
         }
     }
 
-    fn update_display(&mut self) {
-        if !self.initialized {
-            return;
+    pub fn draw_text(&mut self, x: u32, y: u32, text: &str, color: u32) {
+        use crate::drivers::font::FONT_8X8;
+
+        let mut cursor_x = x;
+        let mut cursor_y = y;
+
+        for c in text.chars() {
+            if c == '\n' {
+                cursor_y += 8;
+                cursor_x = x;
+                continue;
+            }
+
+            let char_index = c as usize;
+            if char_index < FONT_8X8.len() {
+                let char_bitmap = FONT_8X8[char_index];
+                for (row, bitmap) in char_bitmap.iter().enumerate() {
+                    for col in 0..8 {
+                        if (bitmap >> (7 - col)) & 1 != 0 {
+                            self.draw_rect(
+                                cursor_x + col as u32,
+                                cursor_y + row as u32,
+                                1,
+                                1,
+                                color,
+                            );
+                        }
+                    }
+                }
+            }
+            cursor_x += 8;
         }
-
-        // Transfer framebuffer to host
-        self.send_command(
-            VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D,
-            &[
-                self.resource_id,
-                0,
-                0, // x, y
-                FB_WIDTH,
-                FB_HEIGHT,
-            ],
-        );
-
-        // Flush the display
-        self.send_command(
-            VIRTIO_GPU_CMD_RESOURCE_FLUSH,
-            &[
-                self.resource_id,
-                0,
-                0, // x, y
-                FB_WIDTH,
-                FB_HEIGHT,
-            ],
-        );
     }
-
-    pub fn flush(&mut self) {
-        self.update_display();
-    }
-}
-
-unsafe impl Send for VirtIOGPU {}
-unsafe impl Sync for VirtIOGPU {}
-
-pub static GPU: Mutex<VirtIOGPU> = Mutex::new(VirtIOGPU::new());
-
-pub fn init() {
-    GPU.lock().init();
 }

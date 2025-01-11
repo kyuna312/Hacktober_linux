@@ -1,76 +1,82 @@
 #![no_std]
 #![no_main]
+#![feature(alloc_error_handler)]
 
-mod console;
-mod cpu;
-mod drivers;
-mod terminal;
+extern crate alloc;
 
 use core::panic::PanicInfo;
+use linked_list_allocator::LockedHeap;
 
-const NYAN_LOGO: &str = r#"
-    /\___/\
-   (  o o  )
-   (  =^=  )
-    (---)
-  /\__/\__/\    NyanNix v1.0.0
- /          \   Welcome to the cutest OS!
-|            |
-|   |  |  |  |
- \  |  |  | /   Press Enter to continue...
-  ~~~~~~~~~~
-"#;
+mod drivers;
+mod ui;
 
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    console::puts("\x1B[1;31mNyan panic! Something went wrong :(\x1B[0m\n");
-    loop {
-        unsafe {
-            cpu::wfi();
-        }
+use drivers::{GPU, KEYBOARD, MOUSE};
+use ui::Terminal;
+
+#[global_allocator]
+static ALLOCATOR: LockedHeap = LockedHeap::empty();
+
+// Change parameter type from char to u32
+#[no_mangle]
+pub extern "C" fn keyboard_handler(keycode: u32) {
+    // Convert keycode to char if needed
+    if let Some(key) = char::from_u32(keycode) {
+        KEYBOARD.lock().push_key(key);
     }
 }
 
 #[no_mangle]
+pub extern "C" fn mouse_handler(dx: i32, dy: i32, buttons: u8) {
+    MOUSE.lock().handle_interrupt(dx, dy, buttons);
+}
+
+#[no_mangle]
 pub extern "C" fn _kernel_main() -> ! {
-    // Initialize basic hardware
+    // Initialize heap
     unsafe {
-        cpu::disable_interrupts();
+        let heap_start = 0x4100_0000 as *mut u8;
+        let heap_size = 1024 * 1024; // 1MB
+        ALLOCATOR.lock().init(heap_start, heap_size);
     }
-    console::init();
 
-    // Show boot logo
-    console::clear_screen();
-    console::puts("\x1B[1;35m"); // Bright magenta
-    console::puts(NYAN_LOGO);
-    console::puts("\x1B[0m\n");
+    // Initialize hardware
+    GPU.lock().init();
+    KEYBOARD.lock().init();
+    MOUSE.lock().init();
 
-    // Wait for Enter key
+    // Create terminal
+    let mut terminal = Terminal::new(50, 50, 700, 500);
+
+    // Draw initial UI
+    let mut gpu = GPU.lock();
+    gpu.clear_screen(0x00336699);
+    terminal.draw();
+    drop(gpu); // Release the lock
+
+    // Main event loop
     loop {
-        if console::getc() == b'\r' {
-            break;
+        // Handle keyboard input
+        if let Some(key) = KEYBOARD.lock().read_key() {
+            terminal.handle_key(key);
         }
-        unsafe {
-            cpu::wfi();
+
+        // Handle mouse input
+        if let Some((x, y, buttons)) = MOUSE.lock().poll() {
+            terminal.handle_mouse(x, y, buttons);
+
+            // Draw cursor
+            let mut gpu = GPU.lock();
+            gpu.draw_rect(x as u32, y as u32, 5, 5, 0x00FFFFFF);
         }
     }
+}
 
-    // Initialize display
-    console::puts("\x1B[1;35mInitializing display...\x1B[0m\n");
-    drivers::virtio::init();
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    loop {}
+}
 
-    // Initialize terminal
-    terminal::init();
-
-    // Show welcome message
-    terminal::puts("\x1B[1;35m=^.^= Welcome to NyanNix! =^.^=\x1B[0m\n\n");
-    terminal::puts("Type 'help' for available commands\n");
-    terminal::puts("Type 'nyan' for a surprise!\n\n");
-    terminal::puts("$ ");
-
-    // Enable interrupts and start terminal
-    unsafe {
-        cpu::enable_interrupts();
-    }
-    terminal::run()
+#[alloc_error_handler]
+fn alloc_error_handler(_layout: core::alloc::Layout) -> ! {
+    loop {}
 }
